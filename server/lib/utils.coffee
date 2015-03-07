@@ -4,6 +4,7 @@ mongoose = require 'mongoose'
 
 module.exports =
   isID: (id) -> _.isString(id) and id.length is 24 and id.match(/[a-f0-9]/gi)?.length is 24
+
   objectIdFromTimestamp: (timestamp) ->
     # mongoDB ObjectId contains creation date in first 4 bytes
     # So, it can be used instead of a redundant created field
@@ -15,6 +16,7 @@ module.exports =
     hexSeconds = Math.floor(timestamp/1000).toString(16)
     # Create an ObjectId with that hex timestamp
     mongoose.Types.ObjectId(hexSeconds + "0000000000000000")
+
   getAnalyticsStringID: (str, callback) ->
     unless str?
       log.error "getAnalyticsStringID given invalid str param"
@@ -46,3 +48,17 @@ module.exports =
         @analyticsStringCache[str] = document._id
         return callback @analyticsStringCache[str]
       insertString()
+
+  getSponsoredSubsAmount: (price=999, subCount=0, personalSub=false) ->
+    # 1 100%
+    # 2-11 80%
+    # 12+ 60%
+    # TODO: make this less confusing
+    return 0 unless subCount > 0
+    offset = if personalSub then 1 else 0
+    if subCount <= 1 - offset
+      price
+    else if subCount <= 11 - offset
+      Math.round((1 - offset) * price + (subCount - 1 + offset) * price * 0.8)
+    else
+      Math.round((1 - offset) * price + 10 * price * 0.8 + (subCount - 11 + offset) * price * 0.6)

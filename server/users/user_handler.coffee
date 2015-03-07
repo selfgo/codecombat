@@ -115,22 +115,36 @@ UserHandler = class UserHandler extends Handler
 
     # Subscription setting
     (req, user, callback) ->
+      # TODO: Make subscribe vs. unsubscribe explicit.  This property dance is confusing.
       return callback(null, req, user) unless req.headers['x-change-plan'] # ensure only saves that are targeted at changing the subscription actually affect the subscription
       return callback(null, req, user) unless req.body.stripe
-      hasPlan = user.get('stripe')?.planID?
+      finishSubscription = (hasPlan, wantsPlan) ->
+        return callback(null, req, user) if hasPlan is wantsPlan
+        if wantsPlan and not hasPlan
+          SubscriptionHandler.subscribeUser(req, user, (err) ->
+            return callback(err) if err
+            return callback(null, req, user)
+          )
+        else if hasPlan and not wantsPlan
+          SubscriptionHandler.unsubscribeUser(req, user, (err) ->
+            return callback(err) if err
+            return callback(null, req, user)
+          )
       wantsPlan = req.body.stripe.planID?
-
-      return callback(null, req, user) if hasPlan is wantsPlan
-      if wantsPlan and not hasPlan
-        SubscriptionHandler.subscribeUser(req, user, (err) ->
-          return callback(err) if err
-          return callback(null, req, user)
-        )
-      else if hasPlan and not wantsPlan
-        SubscriptionHandler.unsubscribeUser(req, user, (err) ->
-          return callback(err) if err
-          return callback(null, req, user)
-        )
+      if req.body.stripe.recipientEmail?
+        User.findOne {emailLower: req.body.stripe.recipientEmail.toLowerCase()}, (err, recipient) =>
+          return callback err if err
+          return callback "Not found." unless recipient
+          hasPlan = false
+          if sponsored = user.get('stripe')?.sponsored
+            for item in sponsored
+              if item.userID is recipient.id
+                hasPlan = item.planID?
+                break
+          finishSubscription hasPlan, wantsPlan
+      else
+        hasPlan = user.get('stripe')?.planID?
+        finishSubscription hasPlan, wantsPlan
 
     # Discount setting
     (req, user, callback) ->

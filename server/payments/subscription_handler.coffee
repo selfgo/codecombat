@@ -1,6 +1,7 @@
 # Not paired with a document in the DB, just handles coordinating between
 # the stripe property in the user with what's being stored in Stripe.
 
+async = require 'async'
 Handler = require '../commons/Handler'
 discountHandler = require './discount_handler'
 User = require '../users/User'
@@ -72,8 +73,8 @@ class SubscriptionHandler extends Handler
 
   checkForExistingSubscription: (req, user, customer, done) ->
     # Check if user is subscribing someone else
-    if req.body.stripe?.recipientEmail?
-      return @updateStripeRecipientSubscription req, user, customer, done
+    if req.body.stripe?.subscribeEmails?
+      return @updateStripeRecipientSubscriptions req, user, customer, done
 
     if user.get('stripe')?.sponsorID
       return done({res: 'You already have a sponsored subscription.', code: 403})
@@ -142,98 +143,116 @@ class SubscriptionHandler extends Handler
       user?.saveActiveUser 'subscribe'
       return done()
 
-  updateStripeRecipientSubscription: (req, user, customer, done) ->
-    unless req.body.stripe?.recipientEmail?
-      return done({res: 'Database error.', code: 500})
+  updateStripeRecipientSubscriptions: (req, user, customer, done) ->
+    return done({res: 'Database error.', code: 500}) unless req.body.stripe?.subscribeEmails?
 
-    User.findOne {emailLower: req.body.stripe.recipientEmail.toLowerCase()}, (err, recipient) =>
+    emails = req.body.stripe.subscribeEmails.map (email) -> email.toLowerCase()
+    User.find {emailLower: {$in: emails}}, (err, recipients) =>
       if err
         @logSubscriptionError(user, "User lookup error. " + err)
         return done({res: 'Database error.', code: 500})
-      unless recipient
-        @logSubscriptionError(user, "Recipient #{req.body.stripe.recipient} not found. " + err)
-        return done({res: 'Not found.', code: 404})
 
-      if recipient.id is user.id
-        # TODO: Don't modify the request object
-        delete req.body.stripe?.recipientEmail
-        return @checkForExistingSubscription(req, user, customer, done)
+      createUpdateFn = (recipient) =>
+        (done) =>
+          # Find existing recipient subscription
+          # TODO: This only checks the latest 10 subscriptions.  E.g. resubscribe the 1st recipient of 20 total.
+          # TODO: Need to call stripe.customers.listSubscriptions to search all of them
+          for sub in customer.subscriptions?.data
+            if sub.metadata?.id is recipient.id
+              subscription = sub
+              break
 
-      # Find existing recipient subscription
-      # TODO: This only checks the latest 10 subscriptions.  E.g. resubscribe the 1st recipient of 20 total.
-      # TODO: Need to call stripe.customers.listSubscriptions to search all of them
-      for sub in customer.subscriptions?.data
-        if sub.metadata?.id is recipient.id
-          subscription = sub
-          break
+          if subscription
+            if subscription.cancel_at_period_end
+              # Things are a little tricky here. Can't re-enable a cancelled subscription,
+              # so it needs to be deleted, but also don't want to charge for the new subscription immediately.
+              # So delete the cancelled subscription (no at_period_end given here) and give the new
+              # subscription a trial period that ends when the cancelled subscription would have ended.
+              stripe.customers.cancelSubscription subscription.customer, subscription.id, (err) =>
+                if err
+                  @logSubscriptionError(user, 'Stripe cancel subscription error. ' + err)
+                  return done({res: 'Database error.', code: 500})
 
-      if subscription
-        if subscription.cancel_at_period_end
-          # Things are a little tricky here. Can't re-enable a cancelled subscription,
-          # so it needs to be deleted, but also don't want to charge for the new subscription immediately.
-          # So delete the cancelled subscription (no at_period_end given here) and give the new
-          # subscription a trial period that ends when the cancelled subscription would have ended.
-          stripe.customers.cancelSubscription subscription.customer, subscription.id, (err) =>
-            if err
-              @logSubscriptionError(user, 'Stripe cancel subscription error. ' + err)
-              return done({res: 'Database error.', code: 500})
+                options =
+                  plan: 'basic'
+                  coupon: recipientCouponID
+                  metadata: {id: recipient.id}
+                  trial_end: subscription.current_period_end
+                stripe.customers.createSubscription customer.id, options, (err, subscription) =>
+                  if err
+                    @logSubscriptionError(user, 'Stripe new subscription error. ' + err)
+                    return done({res: 'Database error.', code: 500})
+                  done(null, recipient: recipient, subscription: subscription, increment: false)
+            else
+              # Can skip creating the subscription
+              done(null, recipient: recipient, subscription: subscription, increment: false)
 
+          else
             options =
               plan: 'basic'
               coupon: recipientCouponID
               metadata: {id: recipient.id}
-              trial_end: subscription.current_period_end
             stripe.customers.createSubscription customer.id, options, (err, subscription) =>
               if err
                 @logSubscriptionError(user, 'Stripe new subscription error. ' + err)
                 return done({res: 'Database error.', code: 500})
-              @updateCocoRecipientSubscription(req, user, customer, false, subscription, recipient, done)
-        else
-          # Can skip creating the subscription
-          @updateCocoRecipientSubscription(req, user, customer, false, subscription, recipient, done)
+              done(null, recipient: recipient, subscription: subscription, increment: true)
 
-      else
-        options =
-          plan: 'basic'
-          coupon: recipientCouponID
-          metadata: {id: recipient.id}
-        stripe.customers.createSubscription customer.id, options, (err, subscription) =>
-          if err
-            @logSubscriptionError(user, 'Stripe new subscription error. ' + err)
-            return done({res: 'Database error.', code: 500})
-          @updateCocoRecipientSubscription(req, user, customer, true, subscription, recipient, done)
+      tasks = []
+      for recipient in recipients
+        continue if recipient.id is user.id
+        continue if recipient.get('stripe')?.subscriptionID?
+        continue if recipient.get('stripe')?.sponsorID? and recipient.get('stripe')?.sponsorID isnt user.id
+        tasks.push createUpdateFn(recipient)
 
-  updateCocoRecipientSubscription: (req, user, customer, increment, subscription, recipient, done) ->
+      # NOTE: async.parellel yields this error:
+      # Subscription Error: user23 (54fe3c8fea98978efa469f3b): 'Stripe new subscription error. Error: Request rate limit exceeded'
+      async.series tasks, (err, results) =>
+        return done(err) if err
+        @updateCocoRecipientSubscriptions(req, user, customer, results, done)
+
+  updateCocoRecipientSubscriptions: (req, user, customer, stripeRecipients, done) ->
     # Update recipients list
     stripeInfo = _.cloneDeep(user.get('stripe') ? {})
     stripeInfo.recipients ?= []
-    _.remove(stripeInfo.recipients, (s) -> s.userID is recipient.id)
-    stripeInfo.recipients.push
-      userID: recipient.id
-      planID: subscription.plan.id
-      subscriptionID: subscription.id
-      couponID: recipientCouponID
+    stripeRecipientIDs = (sub.recipient.id for sub in stripeRecipients)
+    _.remove(stripeInfo.recipients, (s) -> s.userID in stripeRecipientIDs)
+    for sub in stripeRecipients
+      stripeInfo.recipients.push
+        userID: sub.recipient.id
+        planID: sub.subscription.plan.id
+        subscriptionID: sub.subscription.id
+        couponID: recipientCouponID
     user.set('stripe', stripeInfo)
     user.save (err) =>
       if err
         @logSubscriptionError(user, 'User saving stripe error. ' + err)
         return done({res: 'Database error.', code: 500})
 
-      # Update recipient
-      stripeInfo = _.cloneDeep(recipient.get('stripe') ? {})
-      stripeInfo.sponsorID = user.id
-      recipient.set 'stripe', stripeInfo
-      if increment
-        purchased = _.clone(recipient.get('purchased'))
-        purchased ?= {}
-        purchased.gems ?= 0
-        purchased.gems += subscriptions.basic.gems
-        recipient.set('purchased', purchased)
-      recipient.save (err) =>
-        if err
-          @logSubscriptionError(user, 'Stripe user saving stripe error. ' + err)
-          return done({res: 'Database error.', code: 500})
+      createUpdateFn = (recipient, increment) =>
+        (done) =>
+          # Update recipient
+          stripeInfo = _.cloneDeep(recipient.get('stripe') ? {})
+          stripeInfo.sponsorID = user.id
+          recipient.set 'stripe', stripeInfo
+          if increment
+            purchased = _.clone(recipient.get('purchased'))
+            purchased ?= {}
+            purchased.gems ?= 0
+            purchased.gems += subscriptions.basic.gems
+            recipient.set('purchased', purchased)
+          recipient.save (err) =>
+            if err
+              @logSubscriptionError(user, 'Stripe user saving stripe error. ' + err)
+              return done({res: 'Database error.', code: 500})
+            done()
 
+      tasks = []
+      for sub in stripeRecipients
+        tasks.push createUpdateFn(sub.recipient, sub.increment)
+
+      async.parallel tasks, (err, results) =>
+        return done(err) if err
         @updateStripeSponsorSubscription(req, user, customer, done)
 
   updateStripeSponsorSubscription: (req, user, customer, done) ->
@@ -291,7 +310,7 @@ class SubscriptionHandler extends Handler
 
   unsubscribeUser: (req, user, done) ->
     # Check if user is subscribing someone else
-    return @unsubscribeRecipient(req, user, done) if req.body.stripe?.recipientEmail?
+    return @unsubscribeRecipient(req, user, done) if req.body.stripe?.unsubscribeEmail?
 
     stripeInfo = _.cloneDeep(user.get('stripe') ? {})
     stripe.customers.cancelSubscription stripeInfo.customerID, stripeInfo.subscriptionID, { at_period_end: true }, (err) =>
@@ -308,9 +327,9 @@ class SubscriptionHandler extends Handler
         done()
 
   unsubscribeRecipient: (req, user, done) ->
-    return done({res: 'Database error.', code: 500}) unless req.body.stripe?.recipientEmail?
+    return done({res: 'Database error.', code: 500}) unless req.body.stripe?.unsubscribeEmail?
 
-    User.findOne {emailLower: req.body.stripe.recipientEmail.toLowerCase()}, (err, recipient) =>
+    User.findOne {emailLower: req.body.stripe.unsubscribeEmail.toLowerCase()}, (err, recipient) =>
       if err
         @logSubscriptionError(user, "User lookup error. " + err)
         return done({res: 'Database error.', code: 500})

@@ -130,19 +130,18 @@ UserHandler = class UserHandler extends Handler
             return callback(err) if err
             return callback(null, req, user)
           )
-      wantsPlan = req.body.stripe.planID?
-      if req.body.stripe.recipientEmail?
-        User.findOne {emailLower: req.body.stripe.recipientEmail.toLowerCase()}, (err, recipient) =>
-          return callback err if err
-          return callback "Not found." unless recipient
-          hasPlan = false
-          if sponsored = user.get('stripe')?.sponsored
-            for item in sponsored
-              if item.userID is recipient.id
-                hasPlan = item.planID?
-                break
-          finishSubscription hasPlan, wantsPlan
+      if req.body.stripe.subscribeEmails?
+        SubscriptionHandler.subscribeUser(req, user, (err) ->
+          return callback(err) if err
+          return callback(null, req, user)
+        )
+      else if req.body.stripe.unsubscribeEmail?
+        SubscriptionHandler.unsubscribeUser(req, user, (err) ->
+          return callback(err) if err
+          return callback(null, req, user)
+        )
       else
+        wantsPlan = req.body.stripe.planID?
         hasPlan = user.get('stripe')?.planID?
         finishSubscription hasPlan, wantsPlan
 

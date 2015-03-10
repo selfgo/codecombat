@@ -118,6 +118,7 @@ module.exports.setup = (app) ->
       return done() unless subscription.plan.id is 'basic'
       User.findById subscription.metadata.id, (err, recipient) =>
         return res.send(500, '') if err
+        return res.send(500, '') unless recipient
         User.findById recipient.get('stripe').sponsorID, (err, sponsor) =>
           return res.send(500, '') if err
           return res.send(500, '') unless sponsor

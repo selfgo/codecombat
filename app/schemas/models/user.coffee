@@ -289,7 +289,8 @@ _.extend UserSchema.properties,
     free: { type: ['boolean', 'string'], format: 'date-time', description: 'Type string is subscription end date' }
 
     # Sponsored subscriptions
-    recipientEmail: { type: 'string', description: 'For subscribing another user' }
+    subscribeEmails: c.array { description: 'Input for subscribing other users' }, c.shortString()
+    unsubscribeEmail: { type: 'string', description: 'Input for unsubscribing a sponsored user' }
     recipients: c.array { title: 'Recipient subscriptions owned by this user' },
       c.object { required: ['userID', 'subscriptionID'] },
         userID: c.objectId { description: 'User ID of recipient' }

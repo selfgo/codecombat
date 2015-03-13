@@ -5,7 +5,7 @@ async = require 'async'
 Handler = require '../commons/Handler'
 discountHandler = require './discount_handler'
 User = require '../users/User'
-utils = require '../lib/utils'
+utils = require '../../app/core/utils'
 
 recipientCouponID = 'free'
 subscriptions = {
@@ -40,13 +40,11 @@ class SubscriptionHandler extends Handler
           @checkForExistingSubscription(req, user, customer, done)
 
       else
-        newCustomer = {
+        options =
           card: token
           email: user.get('email')
           metadata: { id: user._id + '', slug: user.get('slug') }
-        }
-
-        stripe.customers.create newCustomer, (err, customer) =>
+        stripe.customers.create options, (err, customer) =>
           if err
             if err.type in ['StripeCardError', 'StripeInvalidRequestError']
               return done({res: 'Card error', code: 402})
@@ -85,7 +83,14 @@ class SubscriptionHandler extends Handler
     # overwrite couponID with another for everyone-sales
     #couponID = 'hoc_399' if not couponID
 
-    if subscription = customer.subscriptions?.data?[0]
+    # TODO: Not safe. Use stripe.customers.listSubscriptions instead of only recent 10 on customer.subscriptions.
+    if user.get('stripe')?.subscriptionID?
+      for sub in customer.subscriptions?.data
+        if user.get('stripe').subscriptionID is sub.id
+          subscription = sub
+          break
+
+    if subscription
 
       if subscription.cancel_at_period_end
         # Things are a little tricky here. Can't re-enable a cancelled subscription,
@@ -99,34 +104,36 @@ class SubscriptionHandler extends Handler
 
           options = { plan: 'basic', metadata: {id: user.id}, trial_end: subscription.current_period_end }
           options.coupon = couponID if couponID
-          stripe.customers.update user.get('stripe').customerID, options, (err, customer) =>
+          stripe.customers.createSubscription customer.id, options, (err, subscription) =>
             if err
               @logSubscriptionError(user, 'Stripe customer plan setting error. ' + err)
               return done({res: 'Database error.', code: 500})
 
-            @updateUser(req, user, customer, false, done)
+            @updateUser(req, user, customer, subscription, false, done)
 
       else
         # can skip creating the subscription
-        return @updateUser(req, user, customer, false, done)
+        return @updateUser(req, user, customer, subscription, false, done)
 
     else
       options = { plan: 'basic', metadata: {id: user.id}}
       options.coupon = couponID if couponID
-      stripe.customers.update user.get('stripe').customerID, options, (err, customer) =>
+      stripe.customers.createSubscription customer.id, options, (err, subscription) =>
         if err
           @logSubscriptionError(user, 'Stripe customer plan setting error. ' + err)
           return done({res: 'Database error.', code: 500})
 
-        @updateUser(req, user, customer, true, done)
+        @updateUser(req, user, customer, subscription, true, done)
 
-  updateUser: (req, user, customer, increment, done) ->
-    subscription = customer.subscriptions.data[0]
+  updateUser: (req, user, customer, subscription, increment, done) ->
     stripeInfo = _.cloneDeep(user.get('stripe') ? {})
     stripeInfo.planID = 'basic'
     stripeInfo.subscriptionID = subscription.id
     stripeInfo.customerID = customer.id
-    req.body.stripe = stripeInfo # to make sure things work for admins, who are mad with power
+
+    # To make sure things work for admins, who are mad with power
+    # And, so Handler.saveChangesToDocument doesn't undo all our saves here
+    req.body.stripe = stripeInfo
     user.set('stripe', stripeInfo)
 
     if increment
@@ -146,7 +153,9 @@ class SubscriptionHandler extends Handler
   updateStripeRecipientSubscriptions: (req, user, customer, done) ->
     return done({res: 'Database error.', code: 500}) unless req.body.stripe?.subscribeEmails?
 
-    emails = req.body.stripe.subscribeEmails.map (email) -> email.toLowerCase()
+    emails = req.body.stripe.subscribeEmails.map((email) -> email.trim().toLowerCase() unless _.isEmpty(email))
+    _.remove(emails, (email) -> _.isEmpty(email))
+
     User.find {emailLower: {$in: emails}}, (err, recipients) =>
       if err
         @logSubscriptionError(user, "User lookup error. " + err)
@@ -220,9 +229,13 @@ class SubscriptionHandler extends Handler
     for sub in stripeRecipients
       stripeInfo.recipients.push
         userID: sub.recipient.id
-        planID: sub.subscription.plan.id
         subscriptionID: sub.subscription.id
         couponID: recipientCouponID
+
+    # TODO: how does token get removed for personal subs?
+    delete stripeInfo.subscribeEmails
+    delete stripeInfo.token
+    req.body.stripe = stripeInfo
     user.set('stripe', stripeInfo)
     user.save (err) =>
       if err
@@ -301,6 +314,7 @@ class SubscriptionHandler extends Handler
   updateCocoSponsorSubscription: (req, user, subscription, done) ->
     stripeInfo = _.cloneDeep(user.get('stripe') ? {})
     stripeInfo.sponsorSubscriptionID = subscription.id
+    req.body.stripe = stripeInfo
     user.set('stripe', stripeInfo)
     user.save (err) =>
       if err
@@ -329,7 +343,10 @@ class SubscriptionHandler extends Handler
   unsubscribeRecipient: (req, user, done) ->
     return done({res: 'Database error.', code: 500}) unless req.body.stripe?.unsubscribeEmail?
 
-    User.findOne {emailLower: req.body.stripe.unsubscribeEmail.toLowerCase()}, (err, recipient) =>
+    email = req.body.stripe.unsubscribeEmail.trim().toLowerCase()
+    return done({res: 'Database error.', code: 500}) if _.isEmpty(email)
+
+    User.findOne {emailLower: email}, (err, recipient) =>
       if err
         @logSubscriptionError(user, "User lookup error. " + err)
         return done({res: 'Database error.', code: 500})
@@ -348,7 +365,6 @@ class SubscriptionHandler extends Handler
       for sponsored in stripeInfo.recipients
         if sponsored.userID is recipient.id
           sponsoredEntry = sponsored
-          delete sponsored.planID
           break
       unless sponsoredEntry?
         @logSubscriptionError(user, 'Unable to find sponsored subscription. ' + err)
@@ -360,7 +376,7 @@ class SubscriptionHandler extends Handler
           @logSubscriptionError(user, "Stripe cancel sponsored subscription failed. " + err)
           return done({res: 'Database error.', code: 500})
 
-        # Update recipients entry (planID deleted above)
+        delete stripeInfo.unsubscribeEmail
         user.set('stripe', stripeInfo)
         req.body.stripe = stripeInfo
         user.save (err) =>

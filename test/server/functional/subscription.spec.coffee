@@ -1,7 +1,7 @@
 async = require 'async'
 config = require '../../../server_config'
-utils = require '../../../server/lib/utils'
 require '../common'
+utils = require '../../../app/core/utils' # Must come after require /common
 mongoose = require 'mongoose'
 
 # sample data that comes in through the webhook when you subscribe
@@ -324,13 +324,11 @@ describe 'Sponsored subscriptions', ->
           expect(recipientInfo).toBeDefined()
           expect(recipientInfo.subscriptionID).toBeDefined()
           expect(recipientInfo.subscriptionID).toNotEqual(sponsorStripe.sponsorSubscriptionID)
-          expect(recipientInfo.planID).toEqual('basic')
           expect(recipientInfo.couponID).toEqual('free')
 
           # Verify Stripe recipient subscription data
           stripe.customers.retrieveSubscription sponsorCustomerID, recipientInfo.subscriptionID, (err, subscription) ->
             expect(err).toBeNull()
-            expect(subscription.plan.id).toEqual(recipientInfo.planID)
             expect(subscription.plan.amount).toEqual(subPrice)
             expect(subscription.customer).toEqual(sponsorCustomerID)
             expect(subscription.quantity).toEqual(1)
@@ -344,7 +342,6 @@ describe 'Sponsored subscriptions', ->
               expect(stripeInfo.sponsorID).toEqual(sponsorUserID)
               unless stripeInfo.sponsorSubscriptionID?
                 expect(stripeInfo.customerID).toBeUndefined()
-                expect(stripeInfo.planID).toBeUndefined()
               expect(stripeInfo.token).toBeUndefined()
               expect(recipient.get('purchased').gems).toBeGreaterThan(subGems - 1)
               expect(recipient.isPremium()).toEqual(true)
@@ -392,7 +389,6 @@ describe 'Sponsored subscriptions', ->
     # console.log 'subscribeRecipients', sponsor.id, (recipient.id for recipient in recipients), token?
     requestBody = sponsor.toObject()
     requestBody.stripe =
-      planID: 'basic'
       subscribeEmails: (recipient.get('email') for recipient in recipients)
     requestBody.stripe.token = token.id if token?
     request.put {uri: userURL, json: requestBody, headers: headers }, (err, res, body) ->
@@ -555,7 +551,6 @@ describe 'Sponsored subscriptions', ->
 
           requestBody = user1.toObject()
           requestBody.stripe =
-            planID: 'basic'
             subscribeEmails: [user1.get('email')]
             token: token.id
           request.put {uri: userURL, json: requestBody, headers: headers }, (err, res, body) ->
@@ -740,6 +735,61 @@ describe 'Sponsored subscriptions', ->
                       unless foundProratedInvoice
                         expect(foundProratedInvoice).toEqual(true)
                         done()
+
+    it 'Invalid subscribeEmails', (done) ->
+      stripe.tokens.create {
+        card: { number: '4242424242424242', exp_month: 12, exp_year: 2020, cvc: '123' }
+      }, (err, token) ->
+        loginNewUser (user1) ->
+          requestBody = user1.toObject()
+          requestBody.stripe =
+            subscribeEmails: ['invalid@user.com', 'notemailformat', '', null, undefined]
+          requestBody.stripe.token = token.id
+          request.put {uri: userURL, json: requestBody, headers: headers }, (err, res, body) ->
+            expect(err).toBeNull()
+            expect(res.statusCode).toBe(200)
+            expect(body.stripe).toBeDefined()
+            User.findById user1.id, (err, sponsor) ->
+              expect(err).toBeNull()
+              expect(sponsor.get('stripe')).toBeDefined()
+              expect(sponsor.get('stripe').customerID).toBeDefined()
+              expect(sponsor.get('stripe').sponsorSubscriptionID).toBeDefined()
+              expect(sponsor.get('stripe').recipients?.length).toEqual(0)
+              done()
+
+    it 'User1 subscribes user2 then themselves', (done) ->
+      stripe.tokens.create {
+        card: { number: '4242424242424242', exp_month: 12, exp_year: 2020, cvc: '123' }
+      }, (err, token) ->
+        createNewUser (user2) ->
+          loginNewUser (user1) ->
+            subscribeRecipients user1, [user2], token, (updatedUser) ->
+              User.findById user1.id, (err, user1) ->
+                expect(err).toBeNull()
+                verifySponsorship user1.id, user2.id, ->
+
+                  stripe.tokens.create {
+                    card: { number: '4242424242424242', exp_month: 12, exp_year: 2020, cvc: '123' }
+                  }, (err, token) ->
+                    subscribeUser user1, token, (updatedUser) ->
+                      User.findById user1.id, (err, user1) ->
+                        expect(err).toBeNull()
+                        expect(user1.get('stripe').subscriptionID).toBeDefined()
+                        expect(user1.isPremium()).toEqual(true)
+
+                        stripe.customers.listSubscriptions user1.get('stripe').customerID, (err, subscriptions) ->
+                          expect(err).toBeNull()
+                          expect(subscriptions.data.length).toEqual(3)
+                          for sub in subscriptions.data
+                            if sub.plan.id is 'basic'
+                              if sub.discount?.coupon?.id is 'free'
+                                expect(sub.metadata?.id).toEqual(user2.id)
+                              else
+                                expect(sub.metadata?.id).toEqual(user1.id)
+                            else
+                              expect(sub.plan.id).toEqual('incremental')
+                              expect(sub.metadata?.id).toEqual(user1.id)
+                          done()
 
   describe 'Bulk discounts', ->
     # Bulk discount algorithm (includes personal sub):

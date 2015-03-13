@@ -294,7 +294,6 @@ _.extend UserSchema.properties,
     recipients: c.array { title: 'Recipient subscriptions owned by this user' },
       c.object { required: ['userID', 'subscriptionID'] },
         userID: c.objectId { description: 'User ID of recipient' }
-        planID: { enum: ['basic'], description: 'Determines if a user has or wants to subscribe' }
         subscriptionID: { type: 'string' }
         couponID: { type: 'string' }
     sponsorID: c.objectId { description: "User ID that owns this user's subscription" }

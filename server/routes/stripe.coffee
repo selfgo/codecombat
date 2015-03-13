@@ -5,7 +5,7 @@ User = require '../users/User'
 Payment = require '../payments/Payment'
 errors = require '../commons/errors'
 mongoose = require 'mongoose'
-utils = require '../lib/utils'
+utils = require '../../app/core/utils'
 
 module.exports.setup = (app) ->
   # Cache customer -> user ID map (increases test perf considerably)

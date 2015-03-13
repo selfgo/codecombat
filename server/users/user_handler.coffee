@@ -269,12 +269,14 @@ UserHandler = class UserHandler extends Handler
     return @trackActivity(req, res, args[0], args[2], args[3]) if args[1] is 'track' and args[2]
     return @getRemark(req, res, args[0]) if args[1] is 'remark'
     return @searchForUser(req, res) if args[1] is 'admin_search'
-    return @getStripeInfo(req, res, args[0]) if args[1] is 'stripe'
+    return @getStripeCustomer(req, res, args[0]) if args[1] is 'stripe'
+    return @getSubRecipients(req, res) if args[1] is 'sub_recipients'
+    return @getSubSponsor(req, res) if args[1] is 'sub_sponsor'
     return @sendOneTimeEmail(req, res, args[0]) if args[1] is 'send_one_time_email'
     return @sendNotFoundError(res)
     super(arguments...)
 
-  getStripeInfo: (req, res, handle) ->
+  getStripeCustomer: (req, res, handle) ->
     @getDocumentForIdOrSlug handle, (err, user) =>
       return @sendNotFoundError(res) if not user
       return @sendForbiddenError(res) unless req.user and (req.user.isAdmin() or req.user.get('_id').equals(user.get('_id')))
@@ -282,6 +284,54 @@ UserHandler = class UserHandler extends Handler
       stripe.customers.retrieve customerID, (err, customer) =>
         return @sendDatabaseError(res, err) if err
         @sendSuccess(res, JSON.stringify(customer, null, '\t'))
+
+  getSubRecipients: (req, res) ->
+    return @sendSuccess(res, {}) if _.isEmpty(req.user?.get('stripe')?.recipients ? [])
+    return @sendSuccess(res, {}) unless req.user.get('stripe')?.customerID?
+
+    # Get recipients User info
+    ids = (recipient.userID for recipient in req.user.get('stripe').recipients)
+    User.find({'_id': { $in: ids} }, 'name emailLower').exec (err, users) =>
+      info = {}
+      _.each users, (user) -> info[user.id] = user.toObject()
+
+      # Get recipients subscription info
+      # TODO: handle has_more
+      stripe.customers.listSubscriptions req.user.get('stripe').customerID, limit: 100, (err, subscriptions) =>
+        return @sendDatabaseError(res, err) if err
+        for sub in subscriptions.data
+          userID = sub.metadata?.id
+          continue unless userID of info
+          if sub.cancel_at_period_end and info[userID]['cancel_at_period_end'] isnt false
+            info[userID]['cancel_at_period_end'] = new Date(sub.current_period_end * 1000)
+          else
+            info[userID]['cancel_at_period_end'] = false
+        @sendSuccess(res, info)
+
+  getSubSponsor: (req, res) ->
+    return @sendSuccess(res, {}) unless req.user?.get('stripe')?.sponsorID?
+
+    # Get sponsor User info
+    User.findById req.user.get('stripe').sponsorID, (err, sponsor) =>
+      return @sendDatabaseError(res, err) if err
+      return @sendDatabaseError(res, 'No sponsor customerID') unless sponsor?.get('stripe')?.customerID?
+      info =
+        email: sponsor.get('emailLower')
+        name: sponsor.get('name')
+
+      # Get recipient subscription info
+      # TODO: handle has_more
+      stripe.customers.listSubscriptions sponsor.get('stripe').customerID, limit: 100, (err, subscriptions) =>
+        return @sendDatabaseError(res, err) if err
+        for sub in subscriptions.data
+          userID = sub.metadata?.id
+          continue unless userID is req.user.id
+          unless info.subscription?.cancel_at_period_end is false
+            # Grab latest subscription (in case of a resubscribe)
+            info.subscription = sub
+
+        @sendDatabaseError(res, 'No sponsored subscription found') unless info.subscription?
+        @sendSuccess(res, info)
 
   sendOneTimeEmail: (req, res) ->
     # TODO: Should this API be somewhere else?

@@ -5,7 +5,8 @@ async = require 'async'
 Handler = require '../commons/Handler'
 discountHandler = require './discount_handler'
 User = require '../users/User'
-utils = require '../../app/core/utils'
+{findStripeSubscription} = require '../lib/utils'
+{getSponsoredSubsAmount} = require '../../app/core/utils'
 
 recipientCouponID = 'free'
 subscriptions = {
@@ -83,47 +84,42 @@ class SubscriptionHandler extends Handler
     # overwrite couponID with another for everyone-sales
     #couponID = 'hoc_399' if not couponID
 
-    # TODO: Not safe. Use stripe.customers.listSubscriptions instead of only recent 10 on customer.subscriptions.
-    if user.get('stripe')?.subscriptionID?
-      for sub in customer.subscriptions?.data
-        if user.get('stripe').subscriptionID is sub.id
-          subscription = sub
-          break
+    findStripeSubscription customer.id, subscriptionID: user.get('stripe')?.subscriptionID, (subscription) =>
 
-    if subscription
+      if subscription
 
-      if subscription.cancel_at_period_end
-        # Things are a little tricky here. Can't re-enable a cancelled subscription,
-        # so it needs to be deleted, but also don't want to charge for the new subscription immediately.
-        # So delete the cancelled subscription (no at_period_end given here) and give the new
-        # subscription a trial period that ends when the cancelled subscription would have ended.
-        stripe.customers.cancelSubscription subscription.customer, subscription.id, (err) =>
-          if err
-            @logSubscriptionError(user, 'Stripe cancel subscription error. ' + err)
-            return done({res: 'Database error.', code: 500})
-
-          options = { plan: 'basic', metadata: {id: user.id}, trial_end: subscription.current_period_end }
-          options.coupon = couponID if couponID
-          stripe.customers.createSubscription customer.id, options, (err, subscription) =>
+        if subscription.cancel_at_period_end
+          # Things are a little tricky here. Can't re-enable a cancelled subscription,
+          # so it needs to be deleted, but also don't want to charge for the new subscription immediately.
+          # So delete the cancelled subscription (no at_period_end given here) and give the new
+          # subscription a trial period that ends when the cancelled subscription would have ended.
+          stripe.customers.cancelSubscription subscription.customer, subscription.id, (err) =>
             if err
-              @logSubscriptionError(user, 'Stripe customer plan setting error. ' + err)
+              @logSubscriptionError(user, 'Stripe cancel subscription error. ' + err)
               return done({res: 'Database error.', code: 500})
 
-            @updateUser(req, user, customer, subscription, false, done)
+            options = { plan: 'basic', metadata: {id: user.id}, trial_end: subscription.current_period_end }
+            options.coupon = couponID if couponID
+            stripe.customers.createSubscription customer.id, options, (err, subscription) =>
+              if err
+                @logSubscriptionError(user, 'Stripe customer plan setting error. ' + err)
+                return done({res: 'Database error.', code: 500})
+
+              @updateUser(req, user, customer, subscription, false, done)
+
+        else
+          # can skip creating the subscription
+          return @updateUser(req, user, customer, subscription, false, done)
 
       else
-        # can skip creating the subscription
-        return @updateUser(req, user, customer, subscription, false, done)
+        options = { plan: 'basic', metadata: {id: user.id}}
+        options.coupon = couponID if couponID
+        stripe.customers.createSubscription customer.id, options, (err, subscription) =>
+          if err
+            @logSubscriptionError(user, 'Stripe customer plan setting error. ' + err)
+            return done({res: 'Database error.', code: 500})
 
-    else
-      options = { plan: 'basic', metadata: {id: user.id}}
-      options.coupon = couponID if couponID
-      stripe.customers.createSubscription customer.id, options, (err, subscription) =>
-        if err
-          @logSubscriptionError(user, 'Stripe customer plan setting error. ' + err)
-          return done({res: 'Database error.', code: 500})
-
-        @updateUser(req, user, customer, subscription, true, done)
+          @updateUser(req, user, customer, subscription, true, done)
 
   updateUser: (req, user, customer, subscription, increment, done) ->
     stripeInfo = _.cloneDeep(user.get('stripe') ? {})
@@ -164,48 +160,43 @@ class SubscriptionHandler extends Handler
       createUpdateFn = (recipient) =>
         (done) =>
           # Find existing recipient subscription
-          # TODO: This only checks the latest 10 subscriptions.  E.g. resubscribe the 1st recipient of 20 total.
-          # TODO: Need to call stripe.customers.listSubscriptions to search all of them
-          for sub in customer.subscriptions?.data
-            if sub.metadata?.id is recipient.id
-              subscription = sub
-              break
+          findStripeSubscription customer.id, userID: recipient.id, (subscription) =>
 
-          if subscription
-            if subscription.cancel_at_period_end
-              # Things are a little tricky here. Can't re-enable a cancelled subscription,
-              # so it needs to be deleted, but also don't want to charge for the new subscription immediately.
-              # So delete the cancelled subscription (no at_period_end given here) and give the new
-              # subscription a trial period that ends when the cancelled subscription would have ended.
-              stripe.customers.cancelSubscription subscription.customer, subscription.id, (err) =>
-                if err
-                  @logSubscriptionError(user, 'Stripe cancel subscription error. ' + err)
-                  return done({res: 'Database error.', code: 500})
-
-                options =
-                  plan: 'basic'
-                  coupon: recipientCouponID
-                  metadata: {id: recipient.id}
-                  trial_end: subscription.current_period_end
-                stripe.customers.createSubscription customer.id, options, (err, subscription) =>
+            if subscription
+              if subscription.cancel_at_period_end
+                # Things are a little tricky here. Can't re-enable a cancelled subscription,
+                # so it needs to be deleted, but also don't want to charge for the new subscription immediately.
+                # So delete the cancelled subscription (no at_period_end given here) and give the new
+                # subscription a trial period that ends when the cancelled subscription would have ended.
+                stripe.customers.cancelSubscription subscription.customer, subscription.id, (err) =>
                   if err
-                    @logSubscriptionError(user, 'Stripe new subscription error. ' + err)
+                    @logSubscriptionError(user, 'Stripe cancel subscription error. ' + err)
                     return done({res: 'Database error.', code: 500})
-                  done(null, recipient: recipient, subscription: subscription, increment: false)
-            else
-              # Can skip creating the subscription
-              done(null, recipient: recipient, subscription: subscription, increment: false)
 
-          else
-            options =
-              plan: 'basic'
-              coupon: recipientCouponID
-              metadata: {id: recipient.id}
-            stripe.customers.createSubscription customer.id, options, (err, subscription) =>
-              if err
-                @logSubscriptionError(user, 'Stripe new subscription error. ' + err)
-                return done({res: 'Database error.', code: 500})
-              done(null, recipient: recipient, subscription: subscription, increment: true)
+                  options =
+                    plan: 'basic'
+                    coupon: recipientCouponID
+                    metadata: {id: recipient.id}
+                    trial_end: subscription.current_period_end
+                  stripe.customers.createSubscription customer.id, options, (err, subscription) =>
+                    if err
+                      @logSubscriptionError(user, 'Stripe new subscription error. ' + err)
+                      return done({res: 'Database error.', code: 500})
+                    done(null, recipient: recipient, subscription: subscription, increment: false)
+              else
+                # Can skip creating the subscription
+                done(null, recipient: recipient, subscription: subscription, increment: false)
+
+            else
+              options =
+                plan: 'basic'
+                coupon: recipientCouponID
+                metadata: {id: recipient.id}
+              stripe.customers.createSubscription customer.id, options, (err, subscription) =>
+                if err
+                  @logSubscriptionError(user, 'Stripe new subscription error. ' + err)
+                  return done({res: 'Database error.', code: 500})
+                done(null, recipient: recipient, subscription: subscription, increment: true)
 
       tasks = []
       for recipient in recipients
@@ -271,45 +262,38 @@ class SubscriptionHandler extends Handler
   updateStripeSponsorSubscription: (req, user, customer, done) ->
     stripeInfo = user.get('stripe') ? {}
     numSponsored = stripeInfo.recipients.length
-    quantity = utils.getSponsoredSubsAmount(subscriptions.basic.amount, numSponsored, stripeInfo.subscriptionID?)
+    quantity = getSponsoredSubsAmount(subscriptions.basic.amount, numSponsored, stripeInfo.subscriptionID?)
 
-    # TODO: Use stripe.customers.listSubscriptions instead of only recent 10 on customer.subscriptions
-    # TODO: Cancelling 11 recipient subs in a row would theoretically flush the sponsor sub out of most recent 10
-    # TODO: Subscribing a bunch keeps the sponsor sub in the most recent 10 because it gets an updated quantity for each
-    if stripeInfo.sponsorSubscriptionID?
-      for sub in customer.subscriptions?.data
-        if stripeInfo.sponsorSubscriptionID is sub.id
-          subscription = sub
-          break
-      unless subscription?
+    findStripeSubscription customer.id, subscriptionID: stripeInfo.sponsorSubscriptionID, (subscription) =>
+      if stripeInfo.sponsorSubscriptionID? and not subscription?
         @logSubscriptionError(user, "Internal sponsor subscription #{stripeInfo.sponsorSubscriptionID} not found on Stripe customer #{customer.id}")
         return done({res: 'Database error.', code: 500})
 
-    if subscription
-      return done() if quantity is subscription.quantity # E.g. cancelled sub has been resubbed
+      if subscription
+        return done() if quantity is subscription.quantity # E.g. cancelled sub has been resubbed
 
-      options = quantity: quantity
-      stripe.customers.updateSubscription customer.id, stripeInfo.sponsorSubscriptionID, options, (err, subscription) =>
-        if err
-          @logSubscriptionError(user, 'Stripe updating subscription quantity error. ' + err)
-          return done({res: 'Database error.', code: 500})
-
-        # Invoice proration immediately
-        stripe.invoices.create customer: customer.id, (err, invoice) =>
+        options = quantity: quantity
+        stripe.customers.updateSubscription customer.id, stripeInfo.sponsorSubscriptionID, options, (err, subscription) =>
           if err
-            @logSubscriptionError(user, 'Stripe proration invoice error. ' + err)
+            @logSubscriptionError(user, 'Stripe updating subscription quantity error. ' + err)
             return done({res: 'Database error.', code: 500})
-          done()
-    else
-      options =
-        plan: 'incremental'
-        metadata: {id: user.id}
-        quantity: quantity
-      stripe.customers.createSubscription customer.id, options, (err, subscription) =>
-        if err
-          @logSubscriptionError(user, 'Stripe new subscription error. ' + err)
-          return done({res: 'Database error.', code: 500})
-        @updateCocoSponsorSubscription(req, user, subscription, done)
+
+          # Invoice proration immediately
+          stripe.invoices.create customer: customer.id, (err, invoice) =>
+            if err
+              @logSubscriptionError(user, 'Stripe proration invoice error. ' + err)
+              return done({res: 'Database error.', code: 500})
+            done()
+      else
+        options =
+          plan: 'incremental'
+          metadata: {id: user.id}
+          quantity: quantity
+        stripe.customers.createSubscription customer.id, options, (err, subscription) =>
+          if err
+            @logSubscriptionError(user, 'Stripe new subscription error. ' + err)
+            return done({res: 'Database error.', code: 500})
+          @updateCocoSponsorSubscription(req, user, subscription, done)
 
   updateCocoSponsorSubscription: (req, user, subscription, done) ->
     stripeInfo = _.cloneDeep(user.get('stripe') ? {})

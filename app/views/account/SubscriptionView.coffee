@@ -12,14 +12,12 @@ utils = require 'core/utils'
 # TODO: Conslidate the multiple class for personal and recipient subscription info into 2 simple server API calls
 # TODO: Track purchase amount based on actual users subscribed for a recipient subscribe event
 # TODO: Validate email address formatting
-# TODO: Handle sponsor subscription not being in 10 most recent on customer returned from /stripe call
-# TODO: Handle personal subscription not being in 10 most recent on customer returned from /stripe call
-# TODO: /sub_recipients and /sub_sponsor don't handle has_more on listSubscriptions, big problem for 100+ total subs
 # TODO: i18n pluralization for Stripe dialog description
 # TODO: Don't prompt for new card if we have one already, just confirm purchase
 # TODO: bulk discount isn't applied to personal sub
 # TODO: next payment amount incorrect if have an expiring personal sub
 # TODO: consider hiding managed subscription body UI while things are updating to avoid brief legacy data
+# TODO: Next payment info for personal sub displays most recent payment when resubscribing before trial end
 
 # TODO: Get basic plan price dynamically
 basicPlanPrice = 999
@@ -141,21 +139,20 @@ class PersonalSub
       @subscribed = stripeInfo.planID?
 
       options = { cache: false, url: "/db/user/#{me.id}/stripe" }
-      options.success = (stripeInfo) =>
-        for sub in stripeInfo.subscriptions?.data
-          if sub.id is stripeInfo.subscriptionID
-            periodEnd = new Date((sub.trial_end or sub.current_period_end) * 1000)
-            if sub.cancel_at_period_end
-              @activeUntil = periodEnd
-            else
-              @nextPaymentDate = periodEnd
-              @cost = "$#{(sub.plan.amount/100).toFixed(2)}"
-            break
-        if card = stripeInfo.sources?.data?[0]
+      options.success = (info) =>
+        if card = info.card
           @card = "#{card.brand}: x#{card.last4}"
+        if sub = info.subscription
+          periodEnd = new Date((sub.trial_end or sub.current_period_end) * 1000)
+          if sub.cancel_at_period_end
+            @activeUntil = periodEnd
+          else
+            @nextPaymentDate = periodEnd
+            @cost = "$#{(sub.plan.amount/100).toFixed(2)}"
+        else
+          console.error "Could not find personal subscription #{me.get('stripe')?.customerID} #{me.get('stripe')?.subscriptionID}"
         delete @state
         render()
-
       @supermodel.addRequestResource('personal_payment_info', options).load()
 
       payments = new CocoCollection([], { url: '/db/payment', model: Payment, comparator:'_id' })
@@ -203,7 +200,6 @@ class RecipientSubs
     stripeHandler.open(options)
 
   finishSubscribe: (tokenID, render) ->
-    console.log 'finishSubscribe', tokenID, @state, @recipientEmails
     return unless @state is 'start subscribe' # Don't intercept personal subcribe process
 
     @state = 'subscribing'
@@ -251,12 +247,9 @@ class RecipientSubs
     @unsubscribingRecipients = []
 
     options = { cache: false, url: "/db/user/#{me.id}/stripe" }
-    options.success = (stripeInfo) =>
-      for sub in stripeInfo.subscriptions?.data
-        if sub.id is me.get('stripe').sponsorSubscriptionID
-          @sponsorSub = sub
-          break
-      if card = stripeInfo.sources?.data?[0]
+    options.success = (info) =>
+      @sponsorSub = info.subscription
+      if card = info.card
         @card = "#{card.brand}: x#{card.last4}"
       render()
     @supermodel.addRequestResource('recipients_payment_info', options).load()

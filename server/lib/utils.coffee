@@ -17,6 +17,35 @@ module.exports =
     # Create an ObjectId with that hex timestamp
     mongoose.Types.ObjectId(hexSeconds + "0000000000000000")
 
+  findStripeSubscription: (customerID, options, done) ->
+    # Grabs latest subscription (e.g. in case of a resubscribe)
+    return done() unless customerID?
+    return done() unless options.subscriptionID? or options.userID?
+    subscriptionID = options.subscriptionID
+    userID = options.userID
+
+    subscription = null
+    nextBatch = (starting_after, done) ->
+      options = limit: 100
+      options.starting_after = starting_after if starting_after
+      stripe.customers.listSubscriptions customerID, options, (err, subscriptions) ->
+        return done(subscription) if err
+        return done(subscription) unless subscriptions?.data?.length > 0
+        for sub in subscriptions.data
+          if subscriptionID? and sub.id is subscriptionID
+            unless subscription?.cancel_at_period_end is false
+              subscription = sub
+          if userID? and sub.metadata?.id is userID
+            unless subscription?.cancel_at_period_end is false
+              subscription = sub
+          return done(subscription) if subscription?.cancel_at_period_end is false
+
+        if subscriptions.has_more
+          nextBatch(subscriptions.data[subscriptions.data.length - 1].id, done)
+        else
+          done(subscription)
+    nextBatch(null, done)
+
   getAnalyticsStringID: (str, callback) ->
     unless str?
       log.error "getAnalyticsStringID given invalid str param"

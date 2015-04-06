@@ -30,7 +30,7 @@ module.exports = nativeDescription: "العربية", englishDescription: "Arabi
     about: "حول"
     contact: "اتّصال"
     twitter_follow: "متابعة"
-#    teachers: "Teachers"
+#    teachers: "المدرسون"
 
   modal:
     close: "إغلاق"
